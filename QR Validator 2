@@ -1,0 +1,220 @@
+
+# Retry: add QR validator, scanner component, page route, deps, and a small Vitest test
+import os, pathlib, textwrap, json, zipfile
+
+root = "/mnt/data/veintree-cypherpunk-hackathon"
+os.makedirs(f"{root}/app/src/app", exist_ok=True)
+
+def write(path, content):
+    p = pathlib.Path(path); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(content.strip()+"\n", encoding="utf-8")
+
+# 1) Validator
+validator_ts = """
+// app/src/lib/qr-validator.ts
+import nacl from "tweetnacl";
+import { sha3_256 } from "@noble/hashes/sha3";
+
+const ALLOWED_ACTIONS = new Set(["auth", "sign", "tx"]);
+const MAX_URL_LEN = 2048;
+const DEFAULT_TTL_MS = 60_000;
+
+export type QrPayload =
+  | { action: "auth"; token: string; exp?: number; pk?: string; sig?: string; raw: URL }
+  | { action: "sign"; token: string; exp?: number; pk: string; sig: string; raw: URL }
+  | { action: "tx";   token: string; exp?: number; pk: string; sig: string; raw: URL };
+
+function isBase64Url(s: string): boolean { return /^[A-Za-z0-9\\-_]+$/.test(s); }
+function b64urlToU8(b64url: string): Uint8Array {
+  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((b64url.length + 3) % 4);
+  const bin = typeof atob !== "undefined" ? atob(b64) : Buffer.from(b64, "base64").toString("binary");
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function hash(data: Uint8Array): Uint8Array { return new Uint8Array(sha3_256(data)); }
+function buildCanonicalMessage(url: URL): Uint8Array {
+  const params = new URLSearchParams();
+  params.set("action", url.hostname);
+  if (url.searchParams.has("token")) params.set("token", url.searchParams.get("token")!);
+  if (url.searchParams.has("exp"))   params.set("exp", url.searchParams.get("exp")!);
+  const canonical = `veintree://${params.get("action")}?${params.toString()}`;
+  return new TextEncoder().encode(canonical);
+}
+
+export function isValidQrPayload(
+  input: string,
+  opts?: { nowMs?: number; requireExp?: boolean; maxSkewMs?: number; requireSignature?: boolean; }
+): { ok: true; data: QrPayload } | { ok: false; error: string } {
+  try {
+    if (!input || input.length > MAX_URL_LEN) return { ok: false, error: "invalid_length" };
+    const url = new URL(input);
+    if (url.protocol != "veintree:") return { ok: false, error: "invalid_scheme" };
+    const action = url.hostname;
+    if (!ALLOWED_ACTIONS.has(action)) return { ok: false, error: "invalid_action" };
+
+    const token = url.searchParams.get("token") || "";
+    const expStr = url.searchParams.get("exp");
+    const pk = url.searchParams.get("pk") || undefined;
+    const sig = url.searchParams.get("sig") || undefined;
+    if (!token || !isBase64Url(token)) return { ok: false, error: "invalid_token" };
+
+    const now = opts?.nowMs ?? Date.now();
+    if (opts?.requireExp && !expStr) return { ok: false, error: "missing_exp" };
+    let expMs = expStr ? Number(expStr) : now + DEFAULT_TTL_MS;
+    if (!Number.isFinite(expMs)) return { ok: false, error: "invalid_exp" };
+    if (expMs + (opts?.maxSkewMs ?? 0) < now) return { ok: false, error: "expired" };
+
+    const mustSign = opts?.requireSignature || action === "sign" || action === "tx";
+    if (mustSign) {
+      if (!pk || !sig) return { ok: false, error: "missing_signature" };
+      if (!isBase64Url(sig)) return { ok: false, error: "invalid_sig_format" };
+      if (!isBase64Url(pk)) return { ok: false, error: "invalid_pk_format" };
+      const message = buildCanonicalMessage(url);
+      const digest = hash(message);
+      const sigU8 = b64urlToU8(sig);
+      const pkU8 = b64urlToU8(pk);
+      const valid = nacl.sign.detached.verify(digest, sigU8, pkU8);
+      if (!valid) return { ok: false, error: "bad_signature" };
+    }
+
+    const common = { token, exp: expStr ? expMs : undefined, raw: url } as const;
+    if (action === "auth") return { ok: true, data: { action: "auth", ...common, pk, sig } };
+    if (action === "sign") return { ok: true, data: { action: "sign", ...common, pk: pk!, sig: sig! } };
+    return { ok: true, data: { action: "tx", ...common, pk: pk!, sig: sig! } };
+  } catch {
+    return { ok: false, error: "parse_error" };
+  }
+}
+"""
+write(f"{root}/app/src/lib/qr-validator.ts", validator_ts)
+
+# 2) Component
+scanner_tsx = """
+'use client';
+import { useEffect, useRef, useState } from 'react';
+import { BrowserMultiFormatReader } from '@zxing/browser';
+import { isValidQrPayload } from '../lib/qr-validator';
+
+export default function QrScanner() {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [status, setStatus] = useState<'idle'|'scanning'|'done'|'error'>('idle');
+  const [message, setMessage] = useState<string>('');
+  const [lastPayload, setLastPayload] = useState<any>(null);
+
+  useEffect(() => {
+    const codeReader = new BrowserMultiFormatReader();
+    let controls: { stop: () => void } | null = null;
+    async function start() {
+      try {
+        setStatus('scanning');
+        const devices = await BrowserMultiFormatReader.listVideoInputDevices();
+        const deviceId = devices?.[0]?.deviceId;
+        if (!deviceId) throw new Error('No camera found');
+        controls = await codeReader.decodeFromVideoDevice(deviceId, videoRef.current!, (res, err) => {
+          if (res) {
+            const txt = res.getText();
+            const parsed = isValidQrPayload(txt, { requireExp: true, maxSkewMs: 30_000, requireSignature: false });
+            if (parsed.ok) {
+              setLastPayload(parsed.data);
+              setMessage(`Valid QR (${parsed.data.action})`);
+              setStatus('done');
+              controls?.stop();
+            } else {
+              setMessage(`Invalid: ${parsed.error}`);
+            }
+          }
+          if (err && String(err).includes('NotFoundException')) return;
+        });
+      } catch (e:any) {
+        setMessage(e.message || 'Camera error');
+        setStatus('error');
+      }
+    }
+    start();
+    return () => { controls?.stop(); };
+  }, []);
+
+  return (
+    <section style={{ display: 'grid', gap: 12 }}>
+      <video ref={videoRef} style={{ width: 360, height: 270, background: '#000', borderRadius: 8 }} muted playsInline />
+      <strong>Status:</strong> <span>{status}</span>
+      {message && <p>{message}</p>}
+      {lastPayload && (
+        <pre style={{ whiteSpace: 'pre-wrap', background: '#f6f6f6', padding: 12, borderRadius: 8 }}>{JSON.stringify(lastPayload, null, 2)}</pre>
+      )}
+    </section>
+  );
+}
+"""
+write(f"{root}/app/src/components/QrScanner.tsx", scanner_tsx)
+
+# 3) Page route /qr
+page_qr = """
+'use client';
+import dynamic from 'next/dynamic';
+const Client = dynamic(() => import('../../components/QrScanner'), { ssr: false });
+
+export default function QrPage() {
+  return (
+    <main style={{ padding: 24, fontFamily: 'system-ui, sans-serif' }}>
+      <h1>QR Code Scanner</h1>
+      <p>Scan a Veintree QR (auth/sign/tx). Camera permission required.</p>
+      <Client />
+    </main>
+  );
+}
+"""
+write(f"{root}/app/src/app/qr/page.tsx", page_qr)
+
+# 4) Update app package.json
+pkg_path = pathlib.Path(f"{root}/app/package.json")
+pkg = json.loads(pkg_path.read_text(encoding="utf-8")) if pkg_path.exists() else {"name":"veintree-app","version":"0.1.0","private":True,"dependencies":{},"devDependencies":{},"scripts":{}}
+deps = pkg.get("dependencies", {})
+deps.update({"@zxing/browser":"^0.1.5","tweetnacl":"^1.0.3","@noble/hashes":"^1.4.0"})
+pkg["dependencies"] = deps
+dev = pkg.get("devDependencies", {})
+dev.update({"vitest":"^1.6.0"})
+pkg["devDependencies"] = dev
+scripts = pkg.get("scripts", {})
+scripts.update({"test":"vitest run"})
+pkg["scripts"] = scripts
+pkg_path.write_text(json.dumps(pkg, indent=2), encoding="utf-8")
+
+# 5) Add simple vitest test
+test_ts = """
+import { describe, it, expect } from 'vitest';
+import { isValidQrPayload } from '../src/lib/qr-validator';
+
+function b64url(s: string): string {
+  return Buffer.from(s).toString('base64').replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/,'');
+}
+
+describe('QR validator', () => {
+  it('accepts a valid auth QR with future exp', () => {
+    const token = b64url('demo-token');
+    const exp = Date.now() + 60_000;
+    const url = `veintree://auth?token=${token}&exp=${exp}`;
+    const res = isValidQrPayload(url, { requireExp: true });
+    expect(res.ok).toBe(true);
+  });
+
+  it('rejects wrong scheme', () => {
+    const token = b64url('x');
+    const url = `https://auth?token=${token}`;
+    const res = isValidQrPayload(url, { requireExp: false });
+    expect(res.ok).toBe(false);
+  });
+});
+"""
+write(f"{root}/app/test/qr-validator.test.ts", test_ts)
+
+# 6) Zip
+zip_path = "/mnt/data/veintree-cypherpunk-hackathon-qr.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for folder, _, files in os.walk(root):
+        for fn in files:
+            full = os.path.join(folder, fn)
+            arc = os.path.relpath(full, "/mnt/data")
+            z.write(full, arc)
+
+zip_path
